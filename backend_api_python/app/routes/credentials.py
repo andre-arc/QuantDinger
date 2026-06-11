@@ -210,6 +210,21 @@ def create_credential():
                 'mt5_terminal_path': (data.get('mt5_terminal_path') or '').strip()
             })
             hint = f"{mt5_server}/{mt5_login}"
+        elif exchange_id == 'lighter':
+            # Lighter DEX — EVM wallet private key auth (no API key)
+            private_key = (data.get('private_key') or data.get('privateKey') or '').strip()
+            if not private_key:
+                return jsonify({'code': 0, 'msg': 'Missing private_key', 'data': None}), 400
+            try:
+                account_index = int(data.get('account_index') or 1)
+            except (TypeError, ValueError):
+                account_index = 1
+            config.update({
+                'private_key': private_key,
+                'account_index': account_index,
+                'testnet': bool(data.get('testnet', False)),
+            })
+            hint = f"0x...{private_key[-4:]}" if len(private_key) >= 4 else '0x...'
         elif exchange_id in CRYPTO_EXCHANGES:
             # Crypto exchanges
             api_key = (data.get('api_key') or '').strip()

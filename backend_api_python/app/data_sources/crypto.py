@@ -48,6 +48,9 @@ def resolve_ccxt_for_live_trading(exchange_id: str, market_type: str) -> Tuple[s
         opts["defaultType"] = "swap" if mt == "swap" else "spot"
     elif e == "coinbase":
         ccxt_id = "coinbase"
+    elif e == "lighter":
+        ccxt_id = "lighter"
+        opts["defaultType"] = "swap"
     # unknown id: pass through and let ccxt raise if unsupported
 
     return ccxt_id, opts
@@ -109,9 +112,16 @@ class CryptoDataSource(BaseDataSource):
     
     def __init__(self):
         self._scoped_exchange_id = ""
-        self._scoped_market_type = "spot"
         default_ex = (CCXTConfig.DEFAULT_EXCHANGE or "binance").strip().lower()
-        self._init_ccxt_exchange(default_ex, {})
+        # Lighter is swap-only; default market type must be swap so _symbol_for_scoped_market
+        # appends the :USDC settle suffix correctly.
+        if default_ex == "lighter":
+            self._scoped_exchange_id = "lighter"
+            self._scoped_market_type = "swap"
+            self._init_ccxt_exchange("lighter", {"defaultType": "swap"})
+        else:
+            self._scoped_market_type = "spot"
+            self._init_ccxt_exchange(default_ex, {})
 
     @classmethod
     def for_exchange(cls, exchange_id: str, market_type: str = "swap") -> "CryptoDataSource":
@@ -287,6 +297,14 @@ class CryptoDataSource(BaseDataSource):
                     markets = self._markets_cache or {}
                     if usd_version in markets:
                         return usd_version
+        elif exchange_id == 'lighter':
+            # Lighter settles all perps in USDC; remap /USDT → /USDC
+            if normalized.endswith('/USDT'):
+                usdc_version = normalized.replace('/USDT', '/USDC')
+                if self._ensure_markets_loaded():
+                    markets = self._markets_cache or {}
+                    if f"{usdc_version}:USDC" in markets:
+                        return usdc_version
         
         # 尝试在交易所中查找有效符号
         if self._ensure_markets_loaded():
