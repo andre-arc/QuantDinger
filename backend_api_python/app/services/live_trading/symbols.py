@@ -148,6 +148,31 @@ def to_htx_spot_symbol(symbol: str) -> str:
     return f"{base}{quote}".lower()
 
 
+def to_lighter_coin(symbol: str) -> str:
+    """
+    Convert a QuantDinger symbol to the Lighter market lookup key (base asset, uppercase).
+
+    Lighter uses integer market IDs; this helper resolves the base asset name
+    used as the cache key in LighterClient._market_cache.
+
+    Examples:
+        "BTC/USDT" -> "BTC"
+        "ETH/USDT:USDT" -> "ETH"
+        "SOLUSDT" -> "SOL"
+        "ETH-PERP" -> "ETH"
+    """
+    s = str(symbol or "").strip().upper()
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    for suffix in ("-PERP", "/USDT", "/USD", "/BUSD", "/USDC"):
+        if s.endswith(suffix):
+            return s[: -len(suffix)]
+    if "/" in s:
+        return s.split("/", 1)[0]
+    base, _ = _split_base_quote(s)
+    return base or s
+
+
 def to_htx_contract_code(symbol: str) -> str:
     """
     HTX USDT-margined swap contract code: BASE-QUOTE, e.g. BTC-USDT.

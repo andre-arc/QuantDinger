@@ -40,6 +40,9 @@ MT5Config = None
 AlpacaClient = None
 AlpacaConfig = None
 
+# Lazy import Lighter to avoid ImportError if lighter-sdk not installed
+LighterClient = None
+
 
 def _get(cfg: Dict[str, Any], *keys: str) -> str:
     for k in keys:
@@ -274,6 +277,10 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
     if exchange_id == "alpaca":
         return create_alpaca_client(exchange_config)
 
+    # Lighter DEX: zk-rollup L2 perpetuals, wallet-signing based.
+    if exchange_id == "lighter":
+        return create_lighter_client(exchange_config)
+
     raise LiveTradingError(f"Unsupported exchange_id: {exchange_id}")
 
 
@@ -471,6 +478,55 @@ def create_alpaca_client(exchange_config: Dict[str, Any]):
             "auth/subscribe JSON or symbol (use BTC/USD not BTC/USDT for crypto)."
         )
     return client
+
+
+def create_lighter_client(exchange_config: Dict[str, Any]):
+    """
+    Create Lighter DEX client for zk-rollup perpetuals.
+
+    exchange_config should contain:
+    - private_key:     EVM wallet private key (hex, 0x-prefixed or raw 32 bytes hex)
+    - account_index:   Lighter account sub-key index (default 1; range 2-254 for API sub-keys)
+    - testnet:         Boolean toggle; True = testnet.zklighter.elliot.ai
+
+    Unlike CEX clients there is no api_key/secret pair — authentication is
+    ECDSA signing. Recommend using an API Wallet (sub-key) that cannot withdraw.
+    """
+    global LighterClient
+
+    if LighterClient is None:
+        try:
+            from app.services.live_trading.lighter import LighterClient as _C
+            LighterClient = _C
+        except ImportError:
+            raise LiveTradingError(
+                "Lighter DEX requires lighter-sdk>=1.1.0. Run: pip install 'lighter-sdk>=1.1.0'"
+            )
+
+    private_key = _get(exchange_config, "private_key", "privateKey", "wallet_private_key")
+    if not private_key:
+        raise LiveTradingError("Lighter requires a private_key in exchange_config")
+
+    account_index_raw = exchange_config.get("account_index") or exchange_config.get("accountIndex") or 1
+    try:
+        account_index = int(account_index_raw)
+    except (TypeError, ValueError):
+        account_index = 1
+
+    # Support both the bare `testnet` key and the generic demo-mode flags.
+    testnet_raw = exchange_config.get("testnet")
+    if testnet_raw is None:
+        testnet = _demo_enabled(exchange_config)
+    elif isinstance(testnet_raw, bool):
+        testnet = testnet_raw
+    else:
+        testnet = str(testnet_raw).strip().lower() in ("true", "1", "yes", "on")
+
+    return LighterClient(
+        private_key=private_key,
+        account_index=account_index,
+        testnet=testnet,
+    )
 
 
 def query_fee_rate(

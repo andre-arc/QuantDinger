@@ -83,7 +83,11 @@ def safe_exchange_config_for_log(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         return {}
     out = dict(cfg)
-    for k in ["api_key", "secret_key", "passphrase", "apiKey", "secret", "password"]:
+    for k in [
+        "api_key", "secret_key", "passphrase", "apiKey", "secret", "password",
+        # DEX wallet credentials — must never appear in logs
+        "private_key", "privateKey", "wallet_private_key", "walletPrivateKey",
+    ]:
         if k in out and out.get(k):
             out[k] = mask_secret(str(out.get(k)))
     return out

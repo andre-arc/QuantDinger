@@ -142,5 +142,35 @@
       "avg": 67500.0,
       "status": "filled"
     }
+  },
+  {
+    "id": "lighter_swap_filled",
+    "client": "LighterClient",
+    "market_type": "swap",
+    "response": {
+      "status": "filled",
+      "filled_quantity": "0.01",
+      "avg_fill_price": "68000.5"
+    },
+    "expected": {
+      "filled": 0.01,
+      "avg": 68000.5,
+      "status": "filled"
+    }
+  },
+  {
+    "id": "lighter_swap_partial",
+    "client": "LighterClient",
+    "market_type": "swap",
+    "response": {
+      "status": "partially_filled",
+      "filled_quantity": "0.005",
+      "avg_fill_price": "67800"
+    },
+    "expected": {
+      "filled": 0.005,
+      "avg": 67800.0,
+      "status": "partial"
+    }
   }
 ]

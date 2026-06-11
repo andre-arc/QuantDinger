@@ -67,7 +67,11 @@ docker compose pull frontend && docker compose up -d frontend
 
 # Build from local Vue source (clone QuantDinger-Vue into ./QuantDinger-Vue/ first):
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# Tip: add COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml to project-root .env
+# so plain `docker compose up --build` picks up both files automatically.
 ```
+
+Image tag resolution order: `FRONTEND_TAG` (or `BACKEND_TAG`) → `IMAGE_TAG` → `latest`.
 
 ## Backend Architecture
 
@@ -79,12 +83,14 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 | `app/services/live_trading/` | Exchange REST clients, order contracts, capability matrix, position parsing, sizing, execution helpers |
 | `app/services/grid/` | Grid bot runtime, resting-order placement, fill polling, fill unit conversion, ledger reconciliation |
 | `app/services/pending_orders/` | Reusable live-order building blocks (context loading, direction mapping, fill accumulation, exchange-specific phases) |
+| `app/services/experiment/` | AI experiment pipeline: regime detection (`regime.py`), multi-factor scoring (`scoring.py`), parameter evolution (`evolution.py`), full pipeline orchestration (`runner.py`) |
+| `app/services/bot_scripts/` | User-authored bot scripts runtime and lifecycle |
 | `app/services/pending_order_worker.py` | Queue consumer for pending orders — **legacy hot spot**; prefer extracting small services rather than adding new exchange branches here |
 | `app/services/trading_executor.py` | Realtime strategy loop — **legacy hot spot**; prefer narrow helpers with tests |
 | `app/services/backtest.py` | Historical simulation — **legacy hot spot** |
 | `app/data_sources/` | Market data adapters (CCXT, yfinance, Twelve Data, MOEX, …); failures must be explicit enough to diagnose |
 | `app/data_providers/` | Market data fetchers for the global dashboard; wired into a fallback chain |
-| `app/utils/` | Infrastructure only: auth, DB, cache, logging, time |
+| `app/utils/` | Infrastructure only: auth, DB, cache, logging, time, risk guard, PnL, credential crypto |
 | `app/config/` | Settings, API keys, DB config |
 
 ### Single sources of truth
@@ -99,9 +105,19 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 - **Human Web API** (`/api/...`) — JWT auth; `{ "code": 1, "msg": "success", "data": {} }` envelope; used by the Vue SPA
 - **Agent Gateway** (`/api/agent/v1/...`) — scoped agent tokens (`qd_agent_...`); do not mix with human routes without `x-agent-only` tag
 
+See `docs/API_CONVENTIONS.md` for envelope details and error codes.
+
+### Broker integrations
+
+Crypto venues (Binance, OKX, Bitget, Bybit, Coinbase, Kraken, Gate, HTX) live in `app/services/live_trading/`. Non-crypto brokers have their own service directories:
+
+- **Alpaca** → `app/services/alpaca_trading/`
+- **IBKR** → `app/services/ibkr_trading/`
+- **MT5** → `app/services/mt5_trading/`
+
 ### Strategy execution (`utils/safe_exec.py`)
 
-User-provided Python strategies run inside a sandboxed executor with a strict builtin whitelist (pure computational only — no I/O, no introspection, no code generation). Never expand `safe_exec` permissions without deliberate review.
+User-provided Python strategies run inside a sandboxed executor with a strict builtin whitelist (pure computational only — no I/O, no introspection, no code generation). Never expand `safe_exec` permissions without deliberate review. See `docs/STRATEGY_DEV_GUIDE.md` for the indicator I/O contract.
 
 ### MCP server
 
@@ -112,9 +128,10 @@ User-provided Python strategies run inside a sandboxed executor with a strict bu
 **New exchange (live trading):**
 1. Create client in `app/services/live_trading/<exchange>.py` inheriting `BaseLiveTrading`
 2. Update `capabilities.py` with supported `spot`/`swap` market types
-3. Add fill fixtures in `tests/fixtures/exchanges/order_fill_contracts.json`
-4. Add position fixtures in `tests/fixtures/exchanges/position_contracts.json` (if derivatives)
-5. Run offline contract tests before touching live credentials
+3. Register in `app/services/live_trading/factory.py`
+4. Add fill fixtures in `tests/fixtures/exchanges/order_fill_contracts.json`
+5. Add position fixtures in `tests/fixtures/exchanges/position_contracts.json` (if derivatives)
+6. Run offline contract tests before touching live credentials
 
 **New data source:**
 1. Implement `get_ticker(symbol)` and `get_kline(symbol, timeframe, limit)` in `app/data_sources/<name>.py`
@@ -139,4 +156,14 @@ See `backend_api_python/env.example` for the full list. Key ones:
 | `ADMIN_USER` / `ADMIN_PASSWORD` | yes | Initial admin credentials |
 | `OPENAI_API_KEY` or `OPENROUTER_API_KEY` | no | AI analysis features |
 | `TWELVE_DATA_API_KEY` | no | Forex/commodities; Chinese stocks need paid plan |
+| `ADANOS_API_KEY` | no | Adanos Market Sentiment for US stock tickers |
 | `CACHE_ENABLED` | no | Set `true` to use Redis (auto-set in Docker) |
+| `LIVE_TRADING_SSL_VERIFY` | no | Set `0` to disable TLS verification behind corporate proxies (MITM risk) |
+| `LIVE_TRADING_CA_BUNDLE` | no | Path to PEM CA bundle for custom TLS roots |
+
+## Troubleshooting
+
+- **"apikey parameter is incorrect"** from Twelve Data — verify `TWELVE_DATA_API_KEY` in `.env`; Chinese stock data requires a paid plan.
+- **Heatmap "暂无数据"** — usually NaN in yfinance data; the global JSON encoder sanitises NaN/Inf to `null`.
+- **Redis connection refused** — ensure `redis` service is running (`docker compose up -d redis`); set `CACHE_ENABLED=false` to fall back to in-memory cache.
+- **SSL errors to exchanges in Docker** — add `LIVE_TRADING_CA_BUNDLE` pointing to your corporate CA bundle, or install `ca-certificates` in the image.

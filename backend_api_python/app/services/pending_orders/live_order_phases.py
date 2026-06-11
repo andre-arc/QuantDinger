@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.services.live_trading.base import LiveTradingError
+from app.services.live_trading.lighter import LighterClient
 from app.services.live_trading.binance import BinanceFuturesClient
 from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
@@ -184,6 +185,17 @@ def place_live_limit_order(
             pos_side=pos_side,
             client_order_id=client_order_id,
         )
+    if isinstance(client, LighterClient):
+        # Lighter is net-mode only — pos_side is ignored; reduce_only still applies.
+        return client.place_limit_order(
+            symbol=str(symbol),
+            side=side,
+            qty=amount,
+            price=price,
+            reduce_only=reduce_only,
+            post_only=(order_mode in ("maker", "maker_then_market", "limit_first", "limit")),
+            client_order_id=client_order_id,
+        )
     raise LiveTradingError(f"Unsupported client type: {type(client)}")
 
 
@@ -233,6 +245,8 @@ def wait_live_order_fill(
         return client.wait_for_fill(order_id=order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=wait_sec)
     if isinstance(client, HtxClient):
         return client.wait_for_fill(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id, max_wait_sec=wait_sec)
+    if isinstance(client, LighterClient):
+        return client.wait_for_fill(order_id=order_id, max_wait_sec=wait_sec)
     raise LiveTradingError(f"Unsupported client type: {type(client)}")
 
 
@@ -271,6 +285,8 @@ def cancel_live_limit_order(
         return client.cancel_order(order_id=order_id)
     if isinstance(client, HtxClient):
         return client.cancel_order(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id)
+    if isinstance(client, LighterClient):
+        return client.cancel_order(order_id=order_id)
     return None
 
 
@@ -437,6 +453,15 @@ def place_live_market_order(
             qty=amount,
             reduce_only=reduce_only,
             pos_side=pos_side,
+            client_order_id=client_order_id,
+        )
+    if isinstance(client, LighterClient):
+        # Lighter is net-mode only — pos_side is ignored; reduce_only still applies.
+        return client.place_market_order(
+            symbol=str(symbol),
+            side=side,
+            qty=amount,
+            reduce_only=reduce_only,
             client_order_id=client_order_id,
         )
     raise LiveTradingError(f"Unsupported client type: {type(client)}")
