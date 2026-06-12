@@ -486,7 +486,7 @@ def create_lighter_client(exchange_config: Dict[str, Any]):
 
     exchange_config should contain:
     - private_key:     EVM wallet private key (hex, 0x-prefixed or raw 32 bytes hex)
-    - account_index:   Lighter account sub-key index (default 1; range 2-254 for API sub-keys)
+    - account_index:   Lighter L2 account index shown on the API Keys page (e.g. 281474976710626)
     - testnet:         Boolean toggle; True = testnet.zklighter.elliot.ai
 
     Unlike CEX clients there is no api_key/secret pair — authentication is
@@ -513,6 +513,12 @@ def create_lighter_client(exchange_config: Dict[str, Any]):
     except (TypeError, ValueError):
         account_index = 1
 
+    api_key_index_raw = exchange_config.get("api_key_index") or exchange_config.get("apiKeyIndex") or 255
+    try:
+        api_key_index = int(api_key_index_raw)
+    except (TypeError, ValueError):
+        api_key_index = 255
+
     # Support both the bare `testnet` key and the generic demo-mode flags.
     testnet_raw = exchange_config.get("testnet")
     if testnet_raw is None:
@@ -525,6 +531,7 @@ def create_lighter_client(exchange_config: Dict[str, Any]):
     return LighterClient(
         private_key=private_key,
         account_index=account_index,
+        api_key_index=api_key_index,
         testnet=testnet,
     )
 

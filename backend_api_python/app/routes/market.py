@@ -299,7 +299,7 @@ def search_symbols():
         return jsonify({'code': 0, 'msg': str(e), 'data': []}), 500
 
 
-_crypto_markets_cache: dict = {"data": None, "ts": 0}
+_crypto_markets_cache: dict = {"data": None, "ts": 0, "exchange": None}
 
 
 def _search_crypto_exchange(keyword: str, limit: int, existing: set) -> list:
@@ -313,19 +313,37 @@ def _search_crypto_exchange(keyword: str, limit: int, existing: set) -> list:
         import ccxt  # type: ignore
         from app.config.data_sources import CCXTConfig
 
+        exchange_id = (CCXTConfig.DEFAULT_EXCHANGE or "gate").strip().lower()
+
+        # Determine accepted quote currency and required market type.
+        # Lighter DEX: USDC perpetuals only (type=swap). Most others: USDT spot/swap.
+        _USDC_EXCHANGES = {"lighter"}
+        accepted_quote = "USDC" if exchange_id in _USDC_EXCHANGES else "USDT"
+        required_type = "swap" if exchange_id in _USDC_EXCHANGES else None
+
         now = time.time()
-        if _crypto_markets_cache["data"] and now - _crypto_markets_cache["ts"] < 14400:
+        cache_valid = (
+            _crypto_markets_cache["data"]
+            and now - _crypto_markets_cache["ts"] < 14400
+            and _crypto_markets_cache["exchange"] == exchange_id
+        )
+        if cache_valid:
             markets = _crypto_markets_cache["data"]
         else:
-            exchange_cls = getattr(ccxt, CCXTConfig.DEFAULT_EXCHANGE, None) or ccxt.gate
-            ex = exchange_cls()
+            exchange_cls = getattr(ccxt, exchange_id, None) or ccxt.gate
+            opts = {}
+            if exchange_id == "lighter":
+                opts["defaultType"] = "swap"
+            ex = exchange_cls(opts)
             ex.load_markets()
             markets = []
             for sym, info in ex.markets.items():
                 if not info.get("active"):
                     continue
+                if required_type and info.get("type") != required_type:
+                    continue
                 quote = info.get("quote", "")
-                if quote != "USDT":
+                if quote != accepted_quote:
                     continue
                 markets.append({
                     "symbol": sym,
@@ -334,9 +352,10 @@ def _search_crypto_exchange(keyword: str, limit: int, existing: set) -> list:
                 })
             _crypto_markets_cache["data"] = markets
             _crypto_markets_cache["ts"] = now
-            logger.info("Cached %d USDT crypto pairs from %s", len(markets), CCXTConfig.DEFAULT_EXCHANGE)
+            _crypto_markets_cache["exchange"] = exchange_id
+            logger.info("Cached %d %s crypto pairs from %s", len(markets), accepted_quote, exchange_id)
 
-        kw = keyword.upper().replace("/USDT", "").replace("/", "")
+        kw = keyword.upper().replace("/USDT", "").replace("/USDC", "").replace("/", "")
         results = []
         for m in markets:
             sym = m["symbol"]

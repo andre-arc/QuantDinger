@@ -1777,6 +1777,11 @@ def test_connection():
             if not local_desktop_brokers_allowed():
                 return jsonify({'code': 0, 'msg': desktop_broker_cloud_reject_message(), 'data': None})
             logger.info("Testing connection: exchange_id=%s (local desktop broker, skipping API key check)", ex_id)
+        elif ex_id == 'lighter':
+            private_key = resolved.get('private_key', '')
+            logger.info("Testing connection: exchange_id=lighter")
+            if not private_key:
+                return jsonify({'code': 0, 'msg': 'Please provide a private key for Lighter DEX', 'data': None})
         else:
             api_key = resolved.get('api_key', '')
             secret_key = resolved.get('secret_key', '')

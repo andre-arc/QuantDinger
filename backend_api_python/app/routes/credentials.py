@@ -219,9 +219,14 @@ def create_credential():
                 account_index = int(data.get('account_index') or 1)
             except (TypeError, ValueError):
                 account_index = 1
+            try:
+                api_key_index = int(data.get('api_key_index') or 255)
+            except (TypeError, ValueError):
+                api_key_index = 255
             config.update({
                 'private_key': private_key,
                 'account_index': account_index,
+                'api_key_index': api_key_index,
                 'testnet': bool(data.get('testnet', False)),
             })
             hint = f"0x...{private_key[-4:]}" if len(private_key) >= 4 else '0x...'
