@@ -83,8 +83,9 @@ def _lighter_call(fn, *args, timeout: float = 10.0, **kwargs):
 _TESTNET_HOST = "https://testnet.zklighter.elliot.ai"
 _MAINNET_HOST = "https://mainnet.zklighter.elliot.ai"
 
-_ORDER_TYPE_MARKET = "market"
-_ORDER_TYPE_LIMIT = "limit"
+# Integer order-type constants expected by the lighter C signer (SignerClient.ORDER_TYPE_*)
+_ORDER_TYPE_LIMIT = 0
+_ORDER_TYPE_MARKET = 1
 
 # WebSocket reconnect delays
 _WS_RECONNECT_BASE_SEC = 2.0
@@ -142,13 +143,13 @@ class LighterClient:
             SignerClient, host, self.account_index, {self.api_key_index: pk}
         )
         _cfg = Configuration(host=host)
-        _api = _lighter_call(ApiClient, configuration=_cfg)
-        self.order_api = OrderApi(_api)
-        self.account_api = AccountApi(_api)
-        self.tx_api = TransactionApi(_api)
+        self._api_client = _lighter_call(ApiClient, configuration=_cfg)
+        self.order_api = OrderApi(self._api_client)
+        self.account_api = AccountApi(self._api_client)
+        self.tx_api = TransactionApi(self._api_client)
 
-        # coin (e.g. "BTC") -> (market_id, fetched_at_monotonic)
-        self._market_cache: Dict[str, Tuple[int, float]] = {}
+        # coin (e.g. "BTC") -> (market_id, size_decimals, price_decimals, fetched_at_monotonic)
+        self._market_cache: Dict[str, Tuple[int, int, int, float]] = {}
         self._market_cache_lock = Lock()
         self._market_cache_ttl = 300.0
 
@@ -163,9 +164,10 @@ class LighterClient:
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     def _auth_header(self) -> str:
-        # deadline in seconds; api_key_index selects which key signs the token
+        # deadline=-1 → SDK default of 10 minutes; Lighter rejects tokens with
+        # an expiry window beyond their server-side limit.
         token, err = self.signer.create_auth_token_with_expiry(
-            deadline=3600, api_key_index=self.api_key_index
+            deadline=-1, api_key_index=self.api_key_index
         )
         if err:
             raise LiveTradingError(f"Lighter auth token error: {err}")
@@ -188,18 +190,23 @@ class LighterClient:
                 if isinstance(m, dict):
                     mid = int(m.get("market_id") or 0)
                     coin = str(m.get("symbol") or "").strip().upper()
+                    size_dec = int(m.get("supported_size_decimals") or 0)
+                    price_dec = int(m.get("supported_price_decimals") or 0)
                 else:
                     mid = int(getattr(m, "market_id", 0) or 0)
                     coin = str(getattr(m, "symbol", "") or "").strip().upper()
+                    size_dec = int(getattr(m, "supported_size_decimals", 0) or 0)
+                    price_dec = int(getattr(m, "supported_price_decimals", 0) or 0)
                 if coin and mid:
-                    self._market_cache[coin] = (mid, now)
+                    self._market_cache[coin] = (mid, size_dec, price_dec, now)
 
-    def _resolve_market_id(self, symbol: str) -> int:
+    def _resolve_market(self, symbol: str) -> Tuple[int, int, int]:
+        """Return (market_id, size_decimals, price_decimals) for *symbol*."""
         coin = to_lighter_coin(symbol)
         with self._market_cache_lock:
             entry = self._market_cache.get(coin)
-            if entry and (time.monotonic() - entry[1]) < self._market_cache_ttl:
-                return entry[0]
+            if entry and (time.monotonic() - entry[3]) < self._market_cache_ttl:
+                return entry[0], entry[1], entry[2]
         self._refresh_markets()
         with self._market_cache_lock:
             entry = self._market_cache.get(coin)
@@ -208,7 +215,20 @@ class LighterClient:
                 f"Lighter: unknown symbol '{symbol}' (resolved coin='{coin}'). "
                 "Verify the market exists on Lighter for this network."
             )
-        return entry[0]
+        return entry[0], entry[1], entry[2]
+
+    def _resolve_market_id(self, symbol: str) -> int:
+        return self._resolve_market(symbol)[0]
+
+    @staticmethod
+    def _to_base_amount(qty: float, size_decimals: int) -> int:
+        """Convert a decimal quantity to integer base units (lots)."""
+        return int(round(qty * (10 ** size_decimals)))
+
+    @staticmethod
+    def _to_price_units(price: float, price_decimals: int) -> int:
+        """Convert a decimal price to integer price units."""
+        return int(round(price * (10 ** price_decimals)))
 
     # ── Response parsing ──────────────────────────────────────────────────────
 
@@ -392,6 +412,28 @@ class LighterClient:
         self._ws_stop.set()
         self._ws_ready.set()  # unblock any waiters
 
+    def close(self) -> None:
+        """Close all aiohttp sessions: the shared api_client and the signer's own api_client."""
+        self.stop_ws()
+        try:
+            _lighter_run(self._api_client.close())
+        except Exception:
+            pass
+        try:
+            _lighter_run(self.signer.close())
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        # Fire-and-forget: don't block the GC thread waiting for the coroutines.
+        try:
+            loop = _get_lighter_loop()
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(self._api_client.close(), loop)
+                asyncio.run_coroutine_threadsafe(self.signer.close(), loop)
+        except Exception:
+            pass
+
     # ── Order placement ────────────────────────────────────────────────────────
 
     def place_limit_order(
@@ -405,16 +447,18 @@ class LighterClient:
         post_only: bool = False,
         client_order_id: Optional[str] = None,
     ) -> LiveOrderResult:
-        market_id = self._resolve_market_id(symbol)
+        market_id, size_dec, price_dec = self._resolve_market(symbol)
         is_ask = str(side or "").strip().lower() == "sell"
-        # time_in_force: 0=GTC, 1=IOC, 2=PostOnly
-        tif = 2 if post_only else 0
+        base_amount = self._to_base_amount(qty, size_dec)
+        price_units = self._to_price_units(price, price_dec)
+        # SDK: 0=IOC, 1=GTC (GOOD_TILL_TIME), 2=POST_ONLY
+        tif = 2 if post_only else 1
         try:
             tx_type, tx_info, tx_hash, err = self.signer.sign_create_order(
                 market_id,
-                self.account_index,
-                qty,
-                price,
+                0,          # client_order_index (small per-order counter)
+                base_amount,
+                price_units,
                 is_ask,
                 _ORDER_TYPE_LIMIT,
                 tif,
@@ -423,7 +467,7 @@ class LighterClient:
             )
             if err:
                 raise LiveTradingError(f"Lighter sign_create_order error: {err}")
-            resp = _lighter_run(self.tx_api.send_tx(tx_type, tx_info, tx_hash))
+            resp = _lighter_run(self.tx_api.send_tx(tx_type=tx_type, tx_info=tx_info))
         except LiveTradingError:
             raise
         except Exception as e:
@@ -444,26 +488,59 @@ class LighterClient:
         side: str,
         qty: float,
         *,
+        ref_price: float = 0.0,
         reduce_only: bool = False,
         client_order_id: Optional[str] = None,
     ) -> LiveOrderResult:
-        market_id = self._resolve_market_id(symbol)
+        market_id, size_dec, price_dec = self._resolve_market(symbol)
         is_ask = str(side or "").strip().lower() == "sell"
+        base_amount = self._to_base_amount(qty, size_dec)
+
+        # Lighter requires a "worst acceptable price" for market orders (IoC).
+        # Fetch the live best ask (for buys) or best bid (for sells) from the order
+        # book at the moment of submission — the signal's ref_price may already be
+        # stale by the time this runs.  Apply a 5% buffer so minor price movement
+        # between the fetch and the sequencer doesn't cancel the order.
+        # The actual fill will be at the real market price, not at this limit.
+        try:
+            raw_best = _lighter_run(self.signer.get_best_price(market_id, is_ask))
+            price_units = int(raw_best * (1.05 if not is_ask else 0.95))
+            logger.info(
+                "Lighter market order price: symbol=%s side=%s raw_best=%s price_units=%s "
+                "size_dec=%s price_dec=%s base_amount=%s",
+                symbol, side, raw_best, price_units, size_dec, price_dec, base_amount,
+            )
+        except Exception as e:
+            # Fallback: derive from ref_price / get_mark_price with same 5% buffer
+            mark = float(ref_price or 0.0)
+            if mark <= 0:
+                mark = self.get_mark_price(symbol)
+            if mark <= 0:
+                raise LiveTradingError(f"Lighter: cannot determine market price for {symbol}") from e
+            slippage_price = mark * 1.05 if not is_ask else mark * 0.95
+            price_units = self._to_price_units(slippage_price, price_dec)
+            logger.info(
+                "Lighter market order price (fallback): symbol=%s side=%s mark=%s "
+                "price_units=%s size_dec=%s price_dec=%s base_amount=%s",
+                symbol, side, mark, price_units, size_dec, price_dec, base_amount,
+            )
+
         try:
             tx_type, tx_info, tx_hash, err = self.signer.sign_create_order(
                 market_id,
-                self.account_index,
-                qty,
-                0,         # price=0 for market orders
+                0,          # client_order_index (small per-order counter)
+                base_amount,
+                price_units,
                 is_ask,
                 _ORDER_TYPE_MARKET,
-                0,         # time_in_force=GTC
+                0,          # time_in_force: IOC (ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL=0)
                 reduce_only,
+                order_expiry=0,  # DEFAULT_IOC_EXPIRY; -1 (28-day GTC) is invalid for IOC
                 api_key_index=self.api_key_index,
             )
             if err:
                 raise LiveTradingError(f"Lighter sign_create_order error: {err}")
-            resp = _lighter_run(self.tx_api.send_tx(tx_type, tx_info, tx_hash))
+            resp = _lighter_run(self.tx_api.send_tx(tx_type=tx_type, tx_info=tx_info))
         except LiveTradingError:
             raise
         except Exception as e:
@@ -587,7 +664,7 @@ class LighterClient:
             if err:
                 logger.warning("Lighter sign_cancel_order error (order_id=%s): %s", order_id, err)
                 return {}
-            resp = _lighter_run(self.tx_api.send_tx(tx_type, tx_info, tx_hash))
+            resp = _lighter_run(self.tx_api.send_tx(tx_type=tx_type, tx_info=tx_info))
             return resp if isinstance(resp, dict) else {}
         except Exception as e:
             logger.warning("Lighter cancel_order error (order_id=%s): %s", order_id, e)
@@ -625,18 +702,32 @@ class LighterClient:
 
     def get_mark_price(self, symbol: str) -> float:
         try:
-            market_id = self._resolve_market_id(symbol)
-            # Use recent_trades to get the last traded price as a mark price proxy
-            resp = _lighter_run(self.order_api.recent_trades(market_id=market_id, limit=1))
-            trades = getattr(resp, "trades", None) or (resp if isinstance(resp, list) else [])
-            if trades:
-                t = trades[0]
-                raw_price = (
-                    t.get("price") if isinstance(t, dict)
-                    else getattr(t, "price", None) or getattr(t, "trade_price", None)
-                )
-                if raw_price:
-                    return float(raw_price)
+            market_id, _size_dec, _price_dec = self._resolve_market(symbol)
+            # Try recent trades first (last traded price)
+            try:
+                resp = _lighter_run(self.order_api.recent_trades(market_id=market_id, limit=1))
+                trades = getattr(resp, "trades", None) or (resp if isinstance(resp, list) else [])
+                if trades:
+                    t = trades[0]
+                    raw_price = (
+                        t.get("price") if isinstance(t, dict)
+                        else getattr(t, "price", None) or getattr(t, "trade_price", None)
+                    )
+                    if raw_price:
+                        return float(raw_price)
+            except Exception:
+                pass
+            # Fallback: order-book mid (or best-ask / best-bid) when no recent trades
+            ob = _lighter_run(self.order_api.order_book_orders(market_id, 1))
+            asks = getattr(ob, "asks", None) or []
+            bids = getattr(ob, "bids", None) or []
+            _px = lambda o: float(o["price"] if isinstance(o, dict) else o.price)
+            if asks and bids:
+                return (_px(asks[0]) + _px(bids[0])) / 2
+            if asks:
+                return _px(asks[0])
+            if bids:
+                return _px(bids[0])
         except Exception as e:
             logger.warning("Lighter get_mark_price error (%s): %s", symbol, e)
         return 0.0

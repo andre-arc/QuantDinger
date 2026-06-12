@@ -535,6 +535,7 @@ class PendingOrderWorker:
                 exch_size: Dict[str, Dict[str, float]] = {}
                 exch_entry_price: Dict[str, Dict[str, float]] = {}
                 exch_inst_id: Dict[str, Dict[str, str]] = {}
+                client = None
 
                 if cached_snap is not None:
                     exch_size, exch_entry_price, exch_inst_id = cached_snap
@@ -966,6 +967,12 @@ class PendingOrderWorker:
                     auto_stop_live_strategy(int(sid), msg, source="position_sync")
                 else:
                     logger.error(f"position sync: strategy_id={sid} failed: {e}", exc_info=True)
+            finally:
+                if client is not None and hasattr(client, 'close'):
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
 
     def _sync_alpaca_sent_orders(self, limit: int = 50) -> None:
         rows = self._fetch_alpaca_sent_orders(limit=limit)
@@ -2217,6 +2224,12 @@ class PendingOrderWorker:
             price_hint=avg_price if avg_price > 0 else ref_price,
             amount_hint=filled if filled > 0 else amount,
         )
+
+        if client is not None and hasattr(client, 'close'):
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _execute_ibkr_order(
         self,

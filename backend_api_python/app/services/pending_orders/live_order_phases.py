@@ -457,11 +457,14 @@ def place_live_market_order(
         )
     if isinstance(client, LighterClient):
         # Lighter is net-mode only — pos_side is ignored; reduce_only still applies.
+        # Pass ref_price so the C signer gets a valid "worst acceptable price" without
+        # needing an extra order-book round-trip (which can return 0 on thin markets).
         return client.place_market_order(
             symbol=str(symbol),
             side=side,
             qty=amount,
             reduce_only=reduce_only,
             client_order_id=client_order_id,
+            ref_price=float(ref_price or 0.0),
         )
     raise LiveTradingError(f"Unsupported client type: {type(client)}")

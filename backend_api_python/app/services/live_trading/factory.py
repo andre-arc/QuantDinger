@@ -545,11 +545,18 @@ def query_fee_rate(
     Best-effort: create a temporary client and query the account's fee tier
     for the given symbol.  Returns {"maker": 0.0002, "taker": 0.0005} or None.
     """
+    client = None
     try:
         client = create_client(exchange_config, market_type=market_type)
         return client.get_fee_rate(symbol, market_type=market_type)
     except Exception as e:
         logger.debug(f"query_fee_rate failed for {symbol}: {e}")
         return None
+    finally:
+        if client is not None and hasattr(client, 'close'):
+            try:
+                client.close()
+            except Exception:
+                pass
 
 

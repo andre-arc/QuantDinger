@@ -6,7 +6,7 @@ FROM ${BASE_IMAGE}
 # BUILD_REGION switches apt/PyPI sources:
 #   cn      -> Aliyun mirrors first, fall back to official on failure (default; zero-config for China)
 #   global  -> use Debian/PyPI official directly, skip Aliyun entirely (used by GitHub Actions runners)
-ARG BUILD_REGION=cn
+ARG BUILD_REGION=global
 ARG APP_VERSION=""
 ARG GIT_TAG=""
 
