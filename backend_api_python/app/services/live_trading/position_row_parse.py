@@ -10,6 +10,7 @@ def extract_signed_position_qty(item: Dict[str, Any]) -> float:
     for key in (
         "pos",
         "size",
+        "base_qty",
         "positionAmt",
         "posAmt",
         "currentQty",

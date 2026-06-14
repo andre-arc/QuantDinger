@@ -91,37 +91,37 @@ def _exchange_error_user_message(*, exchange_id: str, err: str) -> Dict[str, str
         ip = _extract_request_ip_from_exchange_error(s)
         if ex == "bitget":
             msg = (
-                f"Bitget API 拒绝：当前出口 IP 未加入白名单"
-                f"{('（' + ip + '）') if ip else ''}。"
-                f"请在 Bitget → API 管理 → 编辑密钥 → IP 白名单中加入该 IP，或暂时关闭 IP 限制。"
+                f"Bitget API rejected: current outbound IP is not whitelisted"
+                f"{(' (' + ip + ')') if ip else ''}. "
+                f"Add this IP in Bitget → API Management → Edit Key → IP Whitelist, or temporarily disable IP restriction."
             )
         else:
             msg = (
-                f"交易所 API 拒绝：IP 未在白名单内"
-                f"{('（' + ip + '）') if ip else ''}，请在交易所 API 设置中添加该 IP。"
+                f"Exchange API rejected: IP not in whitelist"
+                f"{(' (' + ip + ')') if ip else ''}. Add this IP in the exchange API settings."
             )
         return {"message": msg, "hint_key": "quickTrade.errorHints.ipWhitelist", "request_ip": ip}
     if "balance_not_enough" in low or "not enough balance" in low:
         return {
             "message": (
-                "账户余额不足。Gate 等平台现货与合约钱包分开，"
-                "若合约有余额但现货为 0，请先在交易所把 USDT 划转到现货账户。"
+                "Insufficient account balance. On platforms like Gate, spot and futures wallets are separate. "
+                "If you have futures balance but zero spot balance, transfer USDT to your spot wallet first."
             ),
             "hint_key": "quickTrade.errorHints.insufficientBalance",
         }
     if "account-frozen-balance-insufficient" in low or "balance is not enough, left" in low:
         return {
             "message": (
-                "现货可用 USDT 不足（部分资金可能被冻结或挂单占用）。"
-                "请减小下单金额或释放冻结余额后重试。"
+                "Insufficient available spot USDT (some funds may be frozen or held by open orders). "
+                "Reduce order size or free up frozen balance and try again."
             ),
             "hint_key": "quickTrade.errorHints.insufficientBalance",
         }
     if "insufficient margin" in low:
         return {
             "message": (
-                "合约保证金不足：账户可用 USDT 不够覆盖本次开仓所需的保证金。"
-                "请减小下单金额、提高杠杆，或先向合约账户充值/划转 USDT 后重试。"
+                "Insufficient futures margin: available USDT is not enough to cover the required margin for this position. "
+                "Reduce order size, increase leverage, or deposit/transfer USDT to your futures account first."
             ),
             "hint_key": "quickTrade.errorHints.insufficientBalance",
         }
@@ -401,8 +401,7 @@ def _reject_quick_trade_if_desktop_broker(exchange_id: str):
             {
                 "code": 0,
                 "msg": (
-                    "Quick Trade 仅支持加密货币；IBKR / MT5 请通过「交易策略」绑定该凭证并开启实盘/信号执行。"
-                    " | Quick Trade supports crypto only. Bind IBKR/MT5 on a trading strategy for live orders."
+                    "Quick Trade supports crypto only. Bind IBKR/MT5 on a trading strategy for live orders."
                 ),
             }
         ), 400

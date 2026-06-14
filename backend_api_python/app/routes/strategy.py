@@ -857,9 +857,25 @@ def update_strategy():
         if not strategy_id:
             return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
         payload = request.get_json() or {}
+
+        # If the strategy is currently running, stop its thread before applying the
+        # new config, then restart it so the new settings take effect immediately.
+        # The old thread would otherwise keep running with stale in-memory state
+        # (wrong symbol, timeframe, etc.) until manually stopped.
+        executor = get_trading_executor()
+        was_running = executor.is_strategy_thread_alive(strategy_id)
+        if was_running:
+            executor.stop_strategy(strategy_id)
+            logger.info(f"update_strategy: stopped running thread for strategy {strategy_id} before applying edits")
+
         ok = get_strategy_service().update_strategy(strategy_id, payload, user_id=user_id)
         if not ok:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        if was_running:
+            executor.start_strategy(strategy_id)
+            logger.info(f"update_strategy: restarted strategy {strategy_id} with updated config")
+
         return jsonify({'code': 1, 'msg': 'success', 'data': None})
     except Exception as e:
         logger.error(f"update_strategy failed: {str(e)}")
@@ -1682,13 +1698,11 @@ def start_strategy():
                 'data': {'conflict': conflict},
             }), 409
 
-        get_strategy_service().update_strategy_status(strategy_id, 'running', user_id=user_id)
-
         executor = get_trading_executor()
         success = executor.start_strategy(strategy_id)
 
         if not success:
-            # If start failed, restore status
+            # executor sets 'running' on success; on failure ensure DB reflects stopped
             get_strategy_service().update_strategy_status(strategy_id, 'stopped', user_id=user_id)
             detail = getattr(executor, "_last_start_failure", "") or ""
             msg = "Failed to start strategy executor"

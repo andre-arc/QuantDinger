@@ -113,6 +113,7 @@ class TradingExecutor:
     def __init__(self):
         # 不再使用全局连接，改为每次使用时从连接池获取
         self.running_strategies = {}  # {strategy_id: thread}
+        self._dying_threads: Dict[int, threading.Thread] = {}  # threads stopped but not yet dead
         self.lock = threading.Lock()
         # Local-only lightweight in-memory price cache (symbol -> (price, expiry_ts)).
         # This replaces the old Redis-based PriceCache for local deployments.
@@ -733,6 +734,22 @@ class TradingExecutor:
                 for sid in stale_ids:
                     del self.running_strategies[sid]
 
+                # Wait for any recently-stopped thread for THIS strategy to fully exit
+                # before allowing a new one to start (prevents the stop→quick-start race
+                # that would spawn two threads for the same strategy_id).
+                dying = self._dying_threads.pop(strategy_id, None)
+                if dying is not None and dying.is_alive():
+                    dying.join(timeout=12)
+                    if dying.is_alive():
+                        logger.warning(
+                            f"Strategy {strategy_id} previous thread did not exit within 12s; "
+                            "starting new thread anyway."
+                        )
+                # Also purge fully-dead entries from _dying_threads
+                dead_dying = [sid for sid, th in self._dying_threads.items() if not th.is_alive()]
+                for sid in dead_dying:
+                    self._dying_threads.pop(sid, None)
+
                 if len(self.running_strategies) >= self.max_threads:
                     n = len(self.running_strategies)
                     self._last_start_failure = (
@@ -761,11 +778,24 @@ class TradingExecutor:
                     thread.start()
                 except Exception as e:
                     self._last_start_failure = f"启动线程失败: {e}"
-                    # 捕获 can't start new thread 等异常，记录资源状态
                     self._log_resource_status(prefix="启动异常")
                     raise e
                 self.running_strategies[strategy_id] = thread
-                
+
+                # Set DB status to 'running' here so the executor owns the full
+                # lifecycle — callers don't need to set it separately.
+                try:
+                    with get_db_connection() as db:
+                        cur = db.cursor()
+                        cur.execute(
+                            "UPDATE qd_strategies_trading SET status = 'running' WHERE id = %s",
+                            (strategy_id,),
+                        )
+                        db.commit()
+                        cur.close()
+                except Exception as e:
+                    logger.warning(f"start_strategy: failed to set DB status=running for {strategy_id}: {e}")
+
                 logger.info(f"Strategy {strategy_id} started")
                 self._console_print(f"[strategy:{strategy_id}] started")
                 append_strategy_log(strategy_id, "info", "Strategy execution thread started")
@@ -840,6 +870,12 @@ class TradingExecutor:
             reason = self._fetch_recent_strategy_log_hint(sid)
         return False, reason or "执行线程已退出"
     
+    def is_strategy_thread_alive(self, strategy_id: int) -> bool:
+        """Return True if a live thread is registered for this strategy."""
+        with self.lock:
+            thread = self.running_strategies.get(strategy_id)
+            return thread is not None and thread.is_alive()
+
     def stop_strategy(self, strategy_id: int) -> bool:
         """
         停止策略
@@ -865,7 +901,8 @@ class TradingExecutor:
                     cursor.close()
 
                 if had_thread:
-                    del self.running_strategies[strategy_id]
+                    dying = self.running_strategies.pop(strategy_id)
+                    self._dying_threads[strategy_id] = dying
                     self._exchange_fee_cache.pop(strategy_id, None)
                     try:
                         from app.services.grid.runner import shutdown_grid_for_strategy
@@ -2078,15 +2115,15 @@ class TradingExecutor:
             # 即使信号模式下，也要在启动时检查并清理用户在交易所手动平仓但数据库记录还在的情况
             # 这样可以避免策略认为还有持仓而无法执行新的开仓信号
             try:
-                logger.info(f"策略 {strategy_id} 启动时检查持仓同步...")
+                logger.info(f"Strategy {strategy_id} startup position sync...")
                 # 调用持仓同步逻辑（即使signal模式也要检查）
                 from app import get_pending_order_worker
                 worker = get_pending_order_worker()
                 if worker and hasattr(worker, '_sync_positions_best_effort'):
                     worker._sync_positions_best_effort(target_strategy_id=strategy_id)
-                    logger.info(f"策略 {strategy_id} 启动时持仓同步完成")
+                    logger.info(f"Strategy {strategy_id} startup position sync complete")
             except Exception as e:
-                logger.warning(f"策略 {strategy_id} 启动时持仓同步失败（不影响启动）: {e}")
+                logger.warning(f"Strategy {strategy_id} startup position sync failed (non-fatal): {e}")
 
             # 获取当前持仓最高价（从本地数据库读取）
             current_pos_list = self._get_current_positions(strategy_id, symbol)
@@ -2106,7 +2143,7 @@ class TradingExecutor:
                 initial_last_add_price = initial_avg_entry_price
 
             logger.info(
-                f"策略 {strategy_id} 持仓快照: count={len(current_pos_list)}, "
+                f"Strategy {strategy_id} position snapshot: count={len(current_pos_list)}, "
                 f"position={initial_position}, entry_price={initial_avg_entry_price}, highest={initial_highest}"
             )
 
@@ -4441,8 +4478,8 @@ class TradingExecutor:
                     # Best-effort persist a browser notification so UI can show "HOLD due to AI filter".
                     reason = (ai_info or {}).get("reason") or "ai_filter_rejected"
                     ai_decision = (ai_info or {}).get("ai_decision") or ""
-                    title = f"AI过滤拦截开仓 | {symbol}"
-                    msg = f"策略信号={sig}，AI决策={ai_decision or 'UNKNOWN'}，原因={reason}；已HOLD（不下单）"
+                    title = f"AI filter blocked entry | {symbol}"
+                    msg = f"signal={sig}, ai_decision={ai_decision or 'UNKNOWN'}, reason={reason}; HOLD (no order)"
                     self._persist_browser_notification(
                         strategy_id=strategy_id,
                         symbol=symbol,

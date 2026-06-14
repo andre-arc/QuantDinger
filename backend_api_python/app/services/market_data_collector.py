@@ -1076,32 +1076,32 @@ class MarketDataCollector:
         crypto_info = {
             'BTC': {
                 'name': 'Bitcoin',
-                'description': '比特币，数字黄金，市值第一的加密货币，作为价值存储和避险资产',
+                'description': 'Bitcoin, digital gold, the largest cryptocurrency by market cap, used as a store of value and safe-haven asset',
                 'category': 'Store of Value',
             },
             'ETH': {
                 'name': 'Ethereum',
-                'description': '以太坊，智能合约平台，DeFi和NFT生态的基础设施',
+                'description': 'Ethereum, smart contract platform, foundational infrastructure for DeFi and NFT ecosystems',
                 'category': 'Smart Contract Platform',
             },
             'BNB': {
                 'name': 'Binance Coin',
-                'description': '币安币，全球最大交易所的平台代币',
+                'description': 'Binance Coin, native platform token of the world\'s largest crypto exchange',
                 'category': 'Exchange Token',
             },
             'SOL': {
                 'name': 'Solana',
-                'description': '高性能公链，主打高TPS和低Gas费',
+                'description': 'High-performance L1 blockchain focused on high TPS and low transaction fees',
                 'category': 'Smart Contract Platform',
             },
             'XRP': {
                 'name': 'Ripple',
-                'description': '瑞波币，专注跨境支付解决方案',
+                'description': 'Ripple, focused on cross-border payment solutions',
                 'category': 'Payment',
             },
             'DOGE': {
                 'name': 'Dogecoin',
-                'description': '狗狗币，Meme币代表，社区驱动',
+                'description': 'Dogecoin, the original meme coin, community-driven',
                 'category': 'Meme',
             },
         }
@@ -1115,7 +1115,7 @@ class MarketDataCollector:
         
         return {
             'name': base,
-            'description': f'{base} 是一种加密货币',
+            'description': f'{base} is a cryptocurrency',
             'category': 'Unknown',
         }
 
@@ -1129,7 +1129,10 @@ class MarketDataCollector:
         derivatives = self._get_crypto_derivatives_metrics(base_symbol)
         capital_flow = self._get_crypto_capital_flow(base_symbol)
 
-        volume_24h = market_structure.get("volume_24h")
+        # Prefer DEX-native volume when market_structure has no volume data
+        volume_24h = (market_structure.get("volume_24h")
+                      or derivatives.pop("_hyperliquid_volume_24h", None)
+                      or derivatives.pop("_lighter_volume_24h", None))
         volume_change_24h = market_structure.get("volume_change_24h")
         funding_rate = derivatives.get("funding_rate")
         oi_change = derivatives.get("open_interest_change_24h")
@@ -1405,11 +1408,193 @@ class MarketDataCollector:
         if result["long_short_ratio"] is not None:
             result["source"] = "coinglass"
 
-        # Binance 作为部分衍生品字段兜底。
+        # Hyperliquid — single POST returns all perp markets with much larger OI/volume than
+        # Lighter (e.g. HYPE OI $1.25B vs $21M on Lighter). No API key required.
+        if result["funding_rate"] is None or result["open_interest"] is None:
+            result = self._fill_crypto_derivatives_from_hyperliquid(symbol, result)
+
+        # Lighter DEX fallback — covers assets listed on Lighter (BTC, ETH, SOL, HYPE…)
+        # No API key required; catches assets not listed on Hyperliquid.
+        if result["funding_rate"] is None or result["open_interest"] is None:
+            result = self._fill_crypto_derivatives_from_lighter(symbol, result)
+
+        # Binance public API fallback for any remaining nulls.
         if result["funding_rate"] is None or result["open_interest"] is None or result["long_short_ratio"] is None:
             pair = f"{symbol}USDT"
             result = self._fill_crypto_derivatives_from_binance(pair, result)
         return result
+
+    _LIGHTER_HOST = "https://mainnet.zklighter.elliot.ai"
+
+    def _fill_crypto_derivatives_from_lighter(self, symbol: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pull funding rate, OI, and 24h volume from Lighter's public REST API.
+        No API key or credentials required — all endpoints are unauthenticated.
+        Covers any asset listed on Lighter (BTC, ETH, SOL, HYPE, …).
+        """
+        cache_key = f"lighter_derivatives|{symbol}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            merged = dict(result)
+            for k, v in cached.items():
+                if merged.get(k) is None and v is not None:
+                    merged[k] = v
+            return merged
+
+        # Normalise symbol to base coin (e.g. "BTC/USDC" -> "BTC")
+        coin = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+
+        fetched: Dict[str, Any] = {}
+        try:
+            # 1) Funding rates — single public endpoint, returns all markets
+            fr_resp = requests.get(
+                f"{self._LIGHTER_HOST}/api/v1/funding-rates",
+                timeout=8,
+            )
+            fr_resp.raise_for_status()
+            fr_data = fr_resp.json() or {}
+            rates = fr_data.get("funding_rates") or []
+            for fr in rates:
+                sym = str(fr.get("symbol") or "").upper().replace("/USDC", "").replace("/USDT", "")
+                if sym == coin:
+                    rate = fr.get("rate")
+                    if rate is not None:
+                        fetched["funding_rate"] = float(rate)
+                    break
+        except Exception as e:
+            logger.debug("Lighter public funding-rates failed (%s): %s", symbol, e)
+
+        try:
+            # 2) Order books list — find market_id for this coin
+            ob_resp = requests.get(
+                f"{self._LIGHTER_HOST}/api/v1/orderBooks",
+                timeout=8,
+            )
+            ob_resp.raise_for_status()
+            ob_data = ob_resp.json() or {}
+            market_id = None
+            for ob in (ob_data.get("order_books") or []):
+                ob_sym = str(ob.get("symbol") or "").upper().replace("/USDC", "").replace("/USDT", "")
+                if ob_sym == coin:
+                    market_id = ob.get("market_id")
+                    break
+
+            if market_id is not None:
+                # 3) Order book details — OI + volume for specific market
+                det_resp = requests.get(
+                    f"{self._LIGHTER_HOST}/api/v1/orderBookDetails",
+                    params={"market_id": market_id},
+                    timeout=8,
+                )
+                det_resp.raise_for_status()
+                det_data = det_resp.json() or {}
+                # API returns {"order_book_details": [...]} (list, plural)
+                detail_list = (
+                    det_data.get("order_book_details")
+                    or det_data.get("perps_order_book_detail")
+                    or det_data.get("order_book_detail")
+                )
+                if isinstance(detail_list, list):
+                    detail = detail_list[0] if detail_list else {}
+                elif isinstance(detail_list, dict):
+                    detail = detail_list
+                else:
+                    detail = {}
+                oi = detail.get("open_interest")
+                vol = detail.get("daily_quote_token_volume")
+                chg = detail.get("daily_price_change")
+                if oi is not None:
+                    fetched["open_interest"] = float(oi)
+                if vol is not None:
+                    fetched["_lighter_volume_24h"] = float(vol)
+                if chg is not None:
+                    fetched["_lighter_price_change"] = float(chg)
+        except Exception as e:
+            logger.debug("Lighter public orderBookDetails failed (%s): %s", symbol, e)
+
+        if fetched:
+            logger.debug("Lighter derivatives for %s: funding=%s OI=%s vol=%s",
+                         symbol, fetched.get("funding_rate"), fetched.get("open_interest"),
+                         fetched.get("_lighter_volume_24h"))
+
+        # Cache only the persistable fields (no underscore-prefixed stash keys)
+        self._cache_set(cache_key, {k: v for k, v in fetched.items() if not k.startswith("_")}, ttl_sec=90)
+
+        merged = dict(result)
+        for k, v in fetched.items():
+            if k.startswith("_"):
+                merged[k] = v  # volume stash — picked up by _get_crypto_factors
+            elif merged.get(k) is None and v is not None:
+                merged[k] = v
+                merged["source"] = merged.get("source") or "lighter"
+        return merged
+
+    _HYPERLIQUID_HOST = "https://api.hyperliquid.xyz"
+
+    def _fill_crypto_derivatives_from_hyperliquid(self, symbol: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pull funding rate, OI (USD), and 24h volume from Hyperliquid's public info API.
+        Single POST returns all perp markets — much larger scale than Lighter for most assets
+        (HYPE OI ~$1.25B vs Lighter ~$21M). No API key required.
+        """
+        cache_key = f"hyperliquid_derivatives|{symbol}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict) and cached:
+            merged = dict(result)
+            for k, v in cached.items():
+                if merged.get(k) is None and v is not None:
+                    merged[k] = v
+            return merged
+
+        coin = symbol.split("/")[0].upper() if "/" in symbol else symbol.upper()
+        fetched: Dict[str, Any] = {}
+        try:
+            resp = requests.post(
+                f"{self._HYPERLIQUID_HOST}/info",
+                json={"type": "metaAndAssetCtxs"},
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Response is [universe_meta, asset_contexts]
+            # universe_meta["universe"] is list of {name, szDecimals, ...}
+            # asset_contexts is parallel list of {funding, openInterest, dayNtlVlm, markPx, premium, ...}
+            if isinstance(data, list) and len(data) == 2:
+                universe = data[0].get("universe") or []
+                ctx_list = data[1] or []
+                for i, asset_meta in enumerate(universe):
+                    if str(asset_meta.get("name") or "").upper() == coin:
+                        ctx = ctx_list[i] if i < len(ctx_list) else {}
+                        funding = self._safe_num(ctx.get("funding"))
+                        oi_coins = self._safe_num(ctx.get("openInterest"))
+                        vol_usd = self._safe_num(ctx.get("dayNtlVlm"))
+                        mark_px = self._safe_num(ctx.get("markPx"))
+                        if funding is not None:
+                            fetched["funding_rate"] = funding
+                        if oi_coins is not None and mark_px:
+                            fetched["open_interest"] = oi_coins * mark_px
+                        if vol_usd is not None:
+                            fetched["_hyperliquid_volume_24h"] = vol_usd
+                        break
+        except Exception as e:
+            logger.debug("Hyperliquid public derivatives failed (%s): %s", symbol, e)
+
+        if fetched:
+            logger.debug("Hyperliquid derivatives for %s: funding=%s OI=%s vol=%s",
+                         symbol, fetched.get("funding_rate"), fetched.get("open_interest"),
+                         fetched.get("_hyperliquid_volume_24h"))
+
+        self._cache_set(cache_key, {k: v for k, v in fetched.items() if not k.startswith("_")}, ttl_sec=90)
+
+        merged = dict(result)
+        for k, v in fetched.items():
+            if k.startswith("_"):
+                merged[k] = v
+            elif merged.get(k) is None and v is not None:
+                merged[k] = v
+                merged["source"] = merged.get("source") or "hyperliquid"
+        return merged
 
     def _fill_crypto_derivatives_from_binance(self, pair: str, result: Dict[str, Any]) -> Dict[str, Any]:
         cache_key = f"binance_derivatives|{pair}"
@@ -1599,22 +1784,22 @@ class MarketDataCollector:
     ) -> str:
         parts: List[str] = []
         if open_interest_change_24h is not None:
-            parts.append(f"OI {'上升' if open_interest_change_24h >= 0 else '回落'} {abs(open_interest_change_24h):.1f}%")
+            parts.append(f"OI {'rising' if open_interest_change_24h >= 0 else 'falling'} {abs(open_interest_change_24h):.1f}%")
         if funding_rate is not None:
-            parts.append(f"资金费率{'偏正' if funding_rate >= 0 else '偏负'}")
+            parts.append(f"funding rate {'positive' if funding_rate >= 0 else 'negative'}")
         if exchange_netflow is not None:
-            parts.append("交易所净流出" if exchange_netflow < 0 else "交易所净流入")
+            parts.append("exchange net outflow" if exchange_netflow < 0 else "exchange net inflow")
         if stablecoin_netflow is not None:
-            parts.append("稳定币净流入增强" if stablecoin_netflow > 0 else "稳定币净流出")
+            parts.append("stablecoin inflow increasing" if stablecoin_netflow > 0 else "stablecoin net outflow")
         if volume_change_24h is not None:
-            parts.append(f"成交活跃度{'放大' if volume_change_24h > 0 else '回落'}")
+            parts.append(f"volume {'expanding' if volume_change_24h > 0 else 'contracting'}")
         direction = signals.get("derivatives_bias", "neutral")
         flow = signals.get("flow_bias", "neutral")
         squeeze = signals.get("squeeze_risk", "low")
-        outlook = "偏多" if direction == "bullish" or flow == "bullish" else ("偏空" if direction == "bearish" or flow == "bearish" else "中性")
-        risk_text = {"high": "拥挤风险高", "medium": "拥挤度抬升", "low": "拥挤风险低"}.get(squeeze, "风险未知")
-        base = "、".join(parts[:4]) if parts else "链上与衍生品数据有限"
-        return f"{base}，整体{outlook}，{risk_text}"
+        outlook = "bullish" if direction == "bullish" or flow == "bullish" else ("bearish" if direction == "bearish" or flow == "bearish" else "neutral")
+        risk_text = {"high": "crowd risk high", "medium": "crowding increasing", "low": "crowd risk low"}.get(squeeze, "risk unknown")
+        base = ", ".join(parts[:4]) if parts else "on-chain and derivatives data limited"
+        return f"{base}; overall {outlook}, {risk_text}"
     
     def _get_company(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """获取公司信息"""
@@ -1743,7 +1928,7 @@ class MarketDataCollector:
                 if cached_sentiment.get('vix'):
                     vix = cached_sentiment['vix']
                     result['VIX'] = {
-                        'name': 'VIX恐慌指数',
+                        'name': 'VIX Fear Index',
                         'description': vix.get('interpretation', ''),
                         'price': vix.get('value', 0),
                         'change': vix.get('change', 0),
@@ -1754,7 +1939,7 @@ class MarketDataCollector:
                 if cached_sentiment.get('dxy'):
                     dxy = cached_sentiment['dxy']
                     result['DXY'] = {
-                        'name': '美元指数',
+                        'name': 'US Dollar Index (DXY)',
                         'description': dxy.get('interpretation', ''),
                         'price': dxy.get('value', 0),
                         'change': dxy.get('change', 0),
@@ -1765,7 +1950,7 @@ class MarketDataCollector:
                 if cached_sentiment.get('yield_curve'):
                     yc = cached_sentiment['yield_curve']
                     result['TNX'] = {
-                        'name': '美债10年收益率',
+                        'name': 'US 10Y Treasury Yield',
                         'description': yc.get('interpretation', ''),
                         'price': yc.get('yield_10y', 0),
                         'change': yc.get('change', 0),
@@ -1777,7 +1962,7 @@ class MarketDataCollector:
                 if cached_sentiment.get('fear_greed'):
                     fg = cached_sentiment['fear_greed']
                     result['FEAR_GREED'] = {
-                        'name': '恐惧贪婪指数',
+                        'name': 'Fear & Greed Index',
                         'description': fg.get('classification', 'Neutral'),
                         'price': fg.get('value', 50),
                         'change': 0,
@@ -1807,7 +1992,7 @@ class MarketDataCollector:
                                 # 转换为统一格式
                                 if key == 'VIX':
                                     result[key] = {
-                                        'name': 'VIX恐慌指数',
+                                        'name': 'VIX Fear Index',
                                         'description': data.get('interpretation', ''),
                                         'price': data.get('value', 0),
                                         'change': data.get('change', 0),
@@ -1816,7 +2001,7 @@ class MarketDataCollector:
                                     }
                                 elif key == 'DXY':
                                     result[key] = {
-                                        'name': '美元指数',
+                                        'name': 'US Dollar Index (DXY)',
                                         'description': data.get('interpretation', ''),
                                         'price': data.get('value', 0),
                                         'change': data.get('change', 0),
@@ -1825,7 +2010,7 @@ class MarketDataCollector:
                                     }
                                 elif key == 'TNX':
                                     result[key] = {
-                                        'name': '美债10年收益率',
+                                        'name': 'US 10Y Treasury Yield',
                                         'description': data.get('interpretation', ''),
                                         'price': data.get('yield_10y', 0),
                                         'change': data.get('change', 0),
@@ -1835,7 +2020,7 @@ class MarketDataCollector:
                                     }
                                 elif key == 'FEAR_GREED':
                                     result[key] = {
-                                        'name': '恐惧贪婪指数',
+                                        'name': 'Fear & Greed Index',
                                         'description': data.get('classification', 'Neutral'),
                                         'price': data.get('value', 50),
                                         'change': 0,
@@ -1905,7 +2090,7 @@ class MarketDataCollector:
                             "url": item.get('url', ''),
                             "sentiment": item.get('sentiment', 'neutral'),
                         })
-                    logger.info(f"Finnhub 新闻获取成功: {len(news_list)} 条")
+                    logger.info(f"Finnhub news fetched: {len(news_list)} items")
             except Exception as e:
                 logger.debug(f"Finnhub news fetch failed: {e}")
         
@@ -1982,13 +2167,13 @@ class MarketDataCollector:
                         "datetime": result.published_date or datetime.now().strftime('%Y-%m-%d'),
                         "headline": result.title,
                         "summary": result.snippet[:200] if result.snippet else '',
-                        "source": f"搜索:{result.source}",
+                        "source": f"Search:{result.source}",
                         "url": result.url,
                         "sentiment": result.sentiment,
                     })
-                logger.info(f"搜索引擎新闻补充: {len(news_list)} 条 (来源: {response.provider})")
+                logger.info(f"Search engine news supplement: {len(news_list)} items (source: {response.provider})")
         except Exception as e:
-            logger.debug(f"搜索引擎新闻获取失败: {e}")
+            logger.debug(f"Search engine news fetch failed: {e}")
         
         return news_list
     
@@ -2035,7 +2220,7 @@ class MarketDataCollector:
                                 "war", "conflict", "military", "attack", "strike", "sanctions",
                                 "geopolitical", "crisis", "tension", "iran", "israel", "russia",
                                 "ukraine", "middle east", "nato", "united states",
-                                "战争", "冲突", "军事", "袭击", "制裁", "地缘政治", "危机"
+                                "war", "conflict", "military", "attack", "sanctions", "geopolitical", "crisis"
                             ]
                             
                             if any(keyword in text for keyword in major_event_keywords):
@@ -2043,9 +2228,9 @@ class MarketDataCollector:
                                     "datetime": result.published_date or datetime.now().strftime('%Y-%m-%d %H:%M'),
                                     "headline": result.title,
                                     "summary": result.snippet[:300] if result.snippet else '',
-                                    "source": f"全球事件:{result.source}",
+                                    "source": f"GlobalEvent:{result.source}",
                                     "url": result.url,
-                                    "sentiment": "negative" if any(kw in text for kw in ["war", "conflict", "attack", "战争", "冲突", "袭击"]) else "neutral",
+                                    "sentiment": "negative" if any(kw in text for kw in ["war", "conflict", "attack"]) else "neutral",
                                     "is_global_event": True  # 标记为全球事件
                                 })
                                 logger.info(f"Found global major event: {result.title[:60]}")

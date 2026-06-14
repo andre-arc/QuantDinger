@@ -88,6 +88,9 @@ MT5Client = None
 # Lazy import Alpaca to avoid ImportError if alpaca-py not installed
 AlpacaClient = None
 
+# Lazy import Lighter to avoid ImportError if lighter-sdk not installed
+LighterClient = None
+
 logger = get_logger(__name__)
 
 ALPACA_FILL_DELTA_EPSILON = 1e-8
@@ -530,6 +533,14 @@ class PendingOrderWorker:
                     except ImportError:
                         pass
 
+                global LighterClient
+                if LighterClient is None:
+                    try:
+                        from app.services.live_trading.lighter import LighterClient as _LighterClient
+                        LighterClient = _LighterClient
+                    except ImportError:
+                        pass
+
                 cache_key = _position_sync_cache_key(sync_user_id, exchange_id, market_type, exchange_config)
                 cached_snap = _get_position_sync_snapshot(cache_key)
                 exch_size: Dict[str, Dict[str, float]] = {}
@@ -854,6 +865,34 @@ class PendingOrderWorker:
                                     exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = avg
                         # Continue to reconciliation logic below
 
+                    elif LighterClient is not None and isinstance(client, LighterClient):
+                        try:
+                            positions = client.get_all_positions() or []
+                        except Exception as e:
+                            logger.error(f"[PositionSync] Strategy {sid} Lighter get_all_positions failed: {e}", exc_info=True)
+                            continue
+                        for p in positions:
+                            if not isinstance(p, dict):
+                                continue
+                            sym = str(p.get("symbol") or "").strip()
+                            side = str(p.get("side") or "long").strip().lower()
+                            if side not in ("long", "short"):
+                                side = "long"
+                            try:
+                                qty = float(p.get("base_qty") or 0.0)
+                            except Exception:
+                                qty = 0.0
+                            try:
+                                avg = float(p.get("avg_price") or 0.0)
+                            except Exception:
+                                avg = 0.0
+                            if not sym or qty <= 0:
+                                continue
+                            exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = qty
+                            if avg > 0:
+                                exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = avg
+                        # Continue to reconciliation logic below
+
                     elif AlpacaClient is not None and isinstance(client, AlpacaClient):
                         # Alpaca positions cover both US stocks and crypto. The client
                         # already returns a normalized `side` string ("long" / "short")
@@ -955,6 +994,38 @@ class PendingOrderWorker:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) positions: {'; '.join(pos_summary_parts)}")
                 else:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) has NO positions on exchange.")
+
+                # Ghost-position cleanup: if the exchange is flat for a symbol that
+                # the local DB thinks is open, delete the stale L3 row. This handles
+                # manual closes on the exchange (e.g. closed via Lighter UI). We only
+                # delete when the exchange confirms zero — never when the exchange data
+                # is simply missing — to avoid false-positives on multi-strategy accounts.
+                for local_row in plist:
+                    local_sym = str(local_row.get("symbol") or "").strip()
+                    local_side = str(local_row.get("side") or "").strip().lower()
+                    local_size = float(local_row.get("size") or 0.0)
+                    if not local_sym or local_side not in ("long", "short") or local_size <= 0:
+                        continue
+                    # Clean up when the exchange call succeeded (exch_size non-empty)
+                    # AND the exchange is flat for this symbol — either the symbol is
+                    # absent entirely (exchange returned all positions but not this one,
+                    # meaning qty=0) or explicitly zero. Skip when exch_size is empty
+                    # (call may have failed) to avoid false-positive ghost deletions.
+                    exch_is_flat = exch_size and (
+                        local_sym not in exch_size
+                        or float(exch_size[local_sym].get(local_side, 0.0)) <= 0
+                    )
+                    if exch_is_flat:
+                            logger.info(
+                                "[PositionSync] Ghost position removed: strategy=%s %s %s "
+                                "(DB size=%.8f, exchange=0 — likely closed manually)",
+                                sid, local_sym, local_side, local_size,
+                            )
+                            try:
+                                from app.services.live_trading.records import _delete_position
+                                _delete_position(int(sid), local_sym, local_side)
+                            except Exception as _del_err:
+                                logger.warning("[PositionSync] Ghost cleanup failed: %s", _del_err)
 
                 # Keep exchange truth in L1 only. Strategy positions (L3) must be
                 # produced by that strategy's own fills, otherwise two live
@@ -1813,6 +1884,15 @@ class PendingOrderWorker:
                 _notify_live_best_effort(status="failed", error=err, amount_hint=amount, price_hint=ref_price)
                 append_strategy_log(strategy_id, "error", f"Binance set leverage failed for {symbol}: {e}")
                 return
+
+        # Lighter DEX: leverage is per-market and must be set explicitly before each order
+        # (exchange default is 20x which may not match the bot config).
+        if LighterClient is not None and isinstance(client, LighterClient) and market_type == "swap":
+            try:
+                client.set_leverage(symbol=str(symbol), leverage=float(leverage or 1.0))
+                phases["set_leverage"] = {"exchange": "lighter", "symbol": str(symbol), "leverage": float(leverage or 1.0)}
+            except Exception as e:
+                logger.warning(f"Lighter set_leverage failed (non-fatal): pending_id={order_id}, err={e}")
 
         fills = FillAccumulator()
 

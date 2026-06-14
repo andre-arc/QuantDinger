@@ -128,7 +128,7 @@ class BaseSearchProvider(ABC):
                 return key
         
         # 所有 key 都有问题，重置错误计数并返回第一个
-        logger.warning(f"[{self._name}] 所有 API Key 都有错误记录，重置错误计数")
+        logger.warning(f"[{self._name}] All API keys have errors, resetting error counts")
         self._key_errors = {key: 0 for key in self._api_keys}
         return self._api_keys[0] if self._api_keys else None
     
@@ -142,7 +142,7 @@ class BaseSearchProvider(ABC):
     def _record_error(self, key: str) -> None:
         """记录错误"""
         self._key_errors[key] = self._key_errors.get(key, 0) + 1
-        logger.warning(f"[{self._name}] API Key {key[:8]}... 错误计数: {self._key_errors[key]}")
+        logger.warning(f"[{self._name}] API key {key[:8]}... error count: {self._key_errors[key]}")
     
     @abstractmethod
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
@@ -178,7 +178,7 @@ class BaseSearchProvider(ABC):
             
             if response.success:
                 self._record_success(api_key)
-                logger.info(f"[{self._name}] 搜索 '{query}' 成功，返回 {len(response.results)} 条结果，耗时 {response.search_time:.2f}s")
+                logger.info(f"[{self._name}] search '{query}' ok, {len(response.results)} results in {response.search_time:.2f}s")
             else:
                 self._record_error(api_key)
             
@@ -187,7 +187,7 @@ class BaseSearchProvider(ABC):
         except Exception as e:
             self._record_error(api_key)
             elapsed = time.time() - start_time
-            logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
+            logger.error(f"[{self._name}] search '{query}' failed: {e}")
             return SearchResponse(
                 query=query,
                 results=[],
@@ -744,33 +744,33 @@ class SearchService:
         tavily_keys = APIKeys.TAVILY_API_KEYS
         if tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
-            logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
+            logger.info(f"Tavily search configured with {len(tavily_keys)} API key(s)")
         
         # 2. SerpAPI
         serpapi_keys = APIKeys.SERPAPI_KEYS
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
-            logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
+            logger.info(f"SerpAPI search configured with {len(serpapi_keys)} API key(s)")
         
         # 3. Google CSE
         google_api_key = self._config.get('google', {}).get('api_key')
         google_cx = self._config.get('google', {}).get('cx')
         if google_api_key and google_cx:
             self._providers.append(GoogleSearchProvider(google_api_key, google_cx))
-            logger.info("已配置 Google CSE 搜索")
+            logger.info("Google CSE search configured")
         
         # 4. Bing
         bing_api_key = self._config.get('bing', {}).get('api_key')
         if bing_api_key:
             self._providers.append(BingSearchProvider(bing_api_key))
-            logger.info("已配置 Bing 搜索")
+            logger.info("Bing search configured")
         
         # 5. DuckDuckGo（免费兜底）
         self._providers.append(DuckDuckGoSearchProvider())
-        logger.info("已配置 DuckDuckGo 搜索（免费兜底）")
+        logger.info("DuckDuckGo search configured (free fallback)")
         
         if len(self._providers) == 1:
-            logger.warning("仅有 DuckDuckGo 可用，建议配置更多搜索引擎 API Key")
+            logger.warning("Only DuckDuckGo available — configure additional search engine API keys")
     
     @property
     def is_available(self) -> bool:
@@ -826,7 +826,7 @@ class SearchService:
             if response.success and response.results:
                 return response
             else:
-                logger.warning(f"{provider.name} 搜索失败: {response.error_message}，尝试下一个引擎")
+                logger.warning(f"{provider.name} search failed: {response.error_message}, trying next engine")
         
         # 所有引擎都失败
         return SearchResponse(
@@ -875,7 +875,7 @@ class SearchService:
         else:
             query = f"{stock_name} {stock_code} latest news"
         
-        logger.info(f"搜索股票新闻: {stock_name}({stock_code}), market={market}, days={search_days}")
+        logger.info(f"Searching stock news: {stock_name}({stock_code}), market={market}, days={search_days}")
         
         return self.search_with_fallback(query, max_results, search_days)
     
